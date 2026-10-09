@@ -1,0 +1,25 @@
+{
+  "assessment_id": "demo_assessment_001",
+  "label": "合成测评演示数据",
+  "scores": {
+    "holland": {
+      "S": 78,
+      "E": 62,
+      "A": 70
+    },
+    "big_five": {
+      "O": 74,
+      "C": 66,
+      "E": 58
+    },
+    "mbti": {
+      "preference": "N"
+    }
+  },
+  "source": {
+    "kind": "本地演示合成数据",
+    "location": "sanjing/data/assessment.json",
+    "version": "demo-1",
+    "note": "这些数值仅为工程演示而手工构造，不是实际量表作答或诊断。"
+  }
+}

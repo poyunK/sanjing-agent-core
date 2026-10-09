@@ -1,0 +1,79 @@
+{
+  "version": "prototype-0.1",
+  "label": "团队演示假设（未验证）",
+  "source": {
+    "kind": "团队原型规则",
+    "location": "sanjing/data/prototype_rules.json",
+    "note": "用于展示如何保存计算输入、规则和贡献，不是经研究验证的职业测评模型。"
+  },
+  "limitations": [
+    "规则权重是团队为原型演示设定的假设，尚未验证。",
+    "人格和兴趣偏好不等于职业技能、岗位胜任力或录用概率。",
+    "测评分数可能有测量误差；请把结果用于探索方向，不作为限制个人选择的结论。"
+  ],
+  "jobs": {
+    "job_user_research": {
+      "criteria": [
+        {
+          "feature": "holland.S",
+          "label": "霍兰德社会型兴趣 S",
+          "kind": "minimum_score",
+          "target": 70,
+          "weight": 0.4
+        },
+        {
+          "feature": "big_five.O",
+          "label": "大五开放性 O",
+          "kind": "minimum_score",
+          "target": 70,
+          "weight": 0.35
+        },
+        {
+          "feature": "mbti.preference",
+          "label": "MBTI 偏好 N",
+          "kind": "preferred_value",
+          "target": "N",
+          "weight": 0.25
+        }
+      ],
+      "limitations": [
+        "规则没有评估访谈方法、沟通、研究设计或数据分析技能。"
+      ]
+    },
+    "job_product_assistant": {
+      "criteria": [
+        {
+          "feature": "holland.E",
+          "label": "霍兰德企业型兴趣 E",
+          "kind": "minimum_score",
+          "target": 65,
+          "weight": 0.35
+        },
+        {
+          "feature": "big_five.C",
+          "label": "大五尽责性 C",
+          "kind": "minimum_score",
+          "target": 70,
+          "weight": 0.3
+        },
+        {
+          "feature": "big_five.O",
+          "label": "大五开放性 O",
+          "kind": "minimum_score",
+          "target": 65,
+          "weight": 0.2
+        },
+        {
+          "feature": "mbti.preference",
+          "label": "MBTI 偏好 N",
+          "kind": "preferred_value",
+          "target": "N",
+          "weight": 0.15
+        }
+      ],
+      "limitations": [
+        "规则没有评估需求分析、写作、沟通、执行或数据技能。"
+      ]
+    }
+  }
+}

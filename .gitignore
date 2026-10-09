@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+runtime/
+*.sqlite3
+*.sqlite3-*
+.env*
+!*.example
+*Key*.txt
+*key*.txt
+.idea/
+.vscode/
+*.log
+
