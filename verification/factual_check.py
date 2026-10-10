@@ -1,4 +1,4 @@
-"""Replay fixed synthetic fact cases; automated checks cover structure and citations only."""
+"""回放固定合成案例：自动检查结构与引用，原文能否支持推论留给人工核对。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ EXPECTED_ERRORS = {
 
 
 def fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
-    """Build only the explicitly stored synthetic source items for this case."""
+    """从案例文件中的具体合成原文构造返回字典，不查询真实服务。"""
     category = case["category"]
     payload: dict[str, Any] = {
         "code": 0,
@@ -47,7 +47,7 @@ def fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_call(ctx: dict[str, Any], name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Run a registered tool through the same execute_tool boundary as the Agent."""
+    """与真实 Agent 一样经过 execute_tool，保留参数校验与自动事件记录。"""
     reply = _reply([(name, arguments)])
     calls = reply.get("message", {}).get("tool_calls", [])
     if not calls:

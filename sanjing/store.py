@@ -198,6 +198,13 @@ def add_recommendation(db_path, session_id, turn_id, data):
     with connect(db_path) as conn:
         # 一个批次部分失败后模型可能重交成功项；同轮同计算只保留一条建议。
         calculation_id = data.get("calculation_id")
+        if data.get("kind") == "career_decision":
+            encoded = encode(data)
+            previous = conn.execute("SELECT id,data FROM recommendations WHERE session_id=? AND turn_id=?",
+                                    (session_id, turn_id)).fetchall()
+            for row in previous:
+                if row["data"] == encoded:
+                    return row["id"]
         if calculation_id:
             existing = conn.execute("SELECT id,data FROM recommendations WHERE session_id=? AND turn_id=?",
                                     (session_id, turn_id)).fetchall()

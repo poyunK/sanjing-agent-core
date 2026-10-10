@@ -7,18 +7,58 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import inspect
 import math
+import queue
 import re
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import safety
 from .privacy import redact
+from .config import MAX_DATA_REQUESTS, DATA_TIMEOUT_SECONDS
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+_MAX_DATA_RESPONSE_BYTES = 1_048_576
+_MAX_PROFESSIONAL_INDEX_CHARS = 1_500
+_MAX_PROFESSIONAL_RECORD_CHARS = 6_000
+_MAX_DATA_REQUESTS_PER_TURN = MAX_DATA_REQUESTS
+_PROFESSIONAL_CATEGORIES = {
+    "company_profile": "查询企业工商与画像资料：",
+    "company_risk": "查询企业经营与风险资料：",
+    "industry": "查询行业与宏观资料：",
+    "research": "查询研究与学术资料：",
+    "public_financials": "查询公开财务资料：",
+}
+_DATASET_TYPE_ALIASES = {
+    "company_profile": "company_profile", "companyprofile": "company_profile",
+    "enterprise_info": "company_profile", "enterpriseinfo": "company_profile",
+    "企业画像": "company_profile", "企业信息": "company_profile", "工商信息": "company_profile",
+    "company_risk": "company_risk", "companyrisk": "company_risk",
+    "enterprise_risk": "company_risk", "enterpriserisk": "company_risk",
+    "company_info": "company_profile",
+    "企业风险": "company_risk", "风险信息": "company_risk", "经营风险": "company_risk",
+    "industry": "industry", "industry_data": "industry", "宏观": "industry", "行业": "industry",
+    "macro": "industry", "macroeconomic": "industry",
+    "行业数据": "industry", "宏观数据": "industry",
+    "research": "research", "paper": "research", "academic": "research",
+    "academic_search": "research", "research_search": "research",
+    "研究": "research", "学术": "research", "论文": "research",
+    "public_financials": "public_financials", "publicfinancials": "public_financials",
+    "financials": "public_financials", "public_finance": "public_financials",
+    "financial_report": "public_financials", "公开财务": "public_financials", "财务数据": "public_financials",
+}
+_SECRET_FIELD_RE = re.compile(r"(?i)(?:api[_-]?key|access[_-]?key|token|secret|password|authorization|credential)")
+_DATASET_TYPE_ALIASES_NORMALIZED = {
+    re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", alias.casefold()): category
+    for alias, category in _DATASET_TYPE_ALIASES.items()
+}
 
 
 class ToolFailure(Exception):
@@ -81,13 +121,17 @@ def _grant(ctx: dict[str, Any], evidence_id: str) -> None:
     allowed.add(evidence_id)
 
 
-def _save_evidence(ctx: dict[str, Any], kind: str, data: dict[str, Any]) -> str:
+def _save_evidence(
+    ctx: dict[str, Any], kind: str, data: dict[str, Any], *, event_id: str | None = None,
+    grant: bool = True,
+) -> str:
     session_id, turn_id, db_path = _session(ctx)
-    event_id = ctx.get("current_event_id")
+    event_id = event_id or ctx.get("current_event_id")
     evidence_id = _store().add_evidence(
         db_path, session_id, turn_id, kind, data, event_id=event_id
     )
-    _grant(ctx, evidence_id)
+    if grant:
+        _grant(ctx, evidence_id)
     return evidence_id
 
 
@@ -136,6 +180,329 @@ def _dependency_closure(
             raise ToolFailure("invalid_evidence", "依据关联格式无效。")
         stack.extend(dependencies)
     return result
+
+
+def _data_usage(ctx: dict[str, Any]) -> dict[str, int]:
+    usage = ctx.get("data_usage")
+    if not isinstance(usage, dict):
+        usage = {}
+        ctx["data_usage"] = usage
+    for key in ("requests", "success", "failed", "timeouts", "cache_hits", "blocked"):
+        if type(usage.get(key)) is not int or usage[key] < 0:
+            usage[key] = 0
+    return usage
+
+
+def _record_data_failure(ctx: dict[str, Any], category: str, code: str) -> None:
+    failures = ctx.get("data_failures")
+    if not isinstance(failures, list):
+        failures = []
+        ctx["data_failures"] = failures
+    safe_code = code if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code or "") else "data_error"
+    item = {"category": category, "code": safe_code}
+    if item not in failures and len(failures) < _MAX_DATA_REQUESTS_PER_TURN:
+        failures.append(item)
+
+
+def _data_client(ctx: dict[str, Any]):
+    client = ctx.get("data_client")
+    if callable(client):
+        return client
+    try:
+        from .datapro import query_data
+    except Exception:
+        raise ToolFailure("data_provider_unavailable", "专业资料服务当前不可用。") from None
+    return query_data
+
+
+def _call_data_client(ctx: dict[str, Any], category: str, query: str) -> dict[str, Any]:
+    """使用主循环传入的查询函数，最多尝试一次，返回字典供业务层校验。
+
+    ctx 保存本轮截止时间与计数。等待超时后不会采用迟到结果，也不会重试。
+    网络线程不写账本；只有当前执行工具的线程能保存通过检查的结果。
+    """
+    usage = _data_usage(ctx)
+    deadline = ctx.get("deadline")
+    remaining = float(DATA_TIMEOUT_SECONDS)
+    if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
+        remaining = min(float(DATA_TIMEOUT_SECONDS), float(deadline) - time.monotonic())
+    if remaining <= 0:
+        usage["blocked"] += 1
+        _record_data_failure(ctx, category, "deadline_exceeded")
+        raise ToolFailure("data_timeout", "本轮专业资料查询时间已用尽。")
+    if usage["requests"] >= _MAX_DATA_REQUESTS_PER_TURN:
+        usage["blocked"] += 1
+        _record_data_failure(ctx, category, "request_budget_exceeded")
+        raise ToolFailure("data_budget_exceeded", "本轮专业资料查询次数已达上限。")
+
+    try:
+        client = _data_client(ctx)
+    except ToolFailure as exc:
+        usage["blocked"] += 1
+        _record_data_failure(ctx, category, exc.code)
+        raise
+    # 在进入查询客户端之前计一次尝试；缓存命中不会走到这里。
+    usage["requests"] += 1
+    results: queue.Queue = queue.Queue(maxsize=1)
+    try:
+        parameters = inspect.signature(client).parameters.values()
+        accepts_timeout = any((parameter.name == "timeout_seconds" and
+                               parameter.kind != inspect.Parameter.POSITIONAL_ONLY) or
+                              parameter.kind == inspect.Parameter.VAR_KEYWORD
+                              for parameter in parameters)
+    except (TypeError, ValueError):
+        accepts_timeout = False
+
+    def request_once() -> None:
+        try:
+            payload = (client(query, timeout_seconds=remaining)
+                       if accepts_timeout else client(query))
+            results.put((payload, None))
+        except Exception as exc:
+            code = getattr(exc, "code", "data_provider_error")
+            if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code):
+                code = "data_provider_error"
+            results.put((None, code))
+
+    threading.Thread(target=request_once, daemon=True).start()
+    try:
+        payload, error_code = results.get(timeout=remaining)
+    except queue.Empty:
+        usage["failed"] += 1
+        usage["timeouts"] += 1
+        _record_data_failure(ctx, category, "timeout")
+        raise ToolFailure("data_timeout", "专业资料查询超时，本轮没有采用迟到结果。") from None
+    if error_code:
+        usage["failed"] += 1
+        if "TIMEOUT" in error_code.upper() or "DEADLINE" in error_code.upper():
+            usage["timeouts"] += 1
+            _record_data_failure(ctx, category, error_code)
+            raise ToolFailure("data_timeout", "专业资料查询超时；结果和计费状态未知，未自动重试。")
+        _record_data_failure(ctx, category, error_code)
+        if error_code in {"HTTP_401", "HTTP_403", "KEY_INVALID", "KEY_UNAVAILABLE"}:
+            raise ToolFailure("data_auth_error", "专业资料凭证读取或鉴权失败；请检查工程外 Key 文件与服务权限。")
+        raise ToolFailure("data_provider_error", "专业资料服务返回错误，本轮未采用其结果。")
+    return payload
+
+
+def _json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        raise ToolFailure("data_structure_error", "专业资料服务返回了无法解析的数据结构。") from None
+
+
+def _json_chars(value: Any) -> int:
+    return len(_json_bytes(value).decode("utf-8"))
+
+
+def _clean_provider_data(value: Any) -> Any:
+    """Keep a bounded, redacted business snapshot; never persist provider credentials."""
+    if isinstance(value, dict):
+        return {
+            str(key): "[已隐藏]" if _SECRET_FIELD_RE.search(str(key)) else _clean_provider_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_clean_provider_data(item) for item in value]
+    return redact(value)
+
+
+def _normalized_dataset_category(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    key = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", value.casefold())
+    return _DATASET_TYPE_ALIASES_NORMALIZED.get(key)
+
+
+def _json_pointer_tokens(pointer: str) -> list[str]:
+    if not isinstance(pointer, str) or not pointer.startswith("/") or len(pointer) > 300:
+        raise ToolFailure("invalid_field_path", "字段路径必须是有效的 JSON Pointer。")
+    return [part.replace("~1", "/").replace("~0", "~") for part in pointer[1:].split("/")]
+
+
+def _json_pointer_value(value: Any, pointer: str) -> Any:
+    current = value
+    for part in _json_pointer_tokens(pointer):
+        if isinstance(current, dict):
+            if part not in current:
+                raise ToolFailure("field_not_found", "字段路径在该依据中不存在。")
+            current = current[part]
+        elif isinstance(current, list):
+            if not re.fullmatch(r"0|[1-9][0-9]*", part) or int(part) >= len(current):
+                raise ToolFailure("field_not_found", "字段路径在该依据中不存在。")
+            current = current[int(part)]
+        else:
+            raise ToolFailure("field_not_found", "字段路径在该依据中不存在。")
+    if _json_chars(current) > _MAX_PROFESSIONAL_RECORD_CHARS:
+        raise ToolFailure("field_too_large", "引用字段过大，请选择更具体的字段。")
+    return current
+
+
+def _scalar_paths(value: Any, prefix: str = "/record", depth: int = 0) -> list[tuple[str, Any]]:
+    if depth > 4:
+        return []
+    found: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if len(str(key)) > 100 or _SECRET_FIELD_RE.search(str(key)):
+                continue
+            token = str(key).replace("~", "~0").replace("/", "~1")
+            found.extend(_scalar_paths(child, prefix + "/" + token, depth + 1))
+            if len(found) >= 24:
+                break
+    elif isinstance(value, list):
+        if (value and all(not isinstance(child, (dict, list)) for child in value)
+                and len(_json_bytes(value)) <= 600):
+            found.append((prefix, value))
+            return found
+        for index, child in enumerate(value[:10]):
+            found.extend(_scalar_paths(child, prefix + "/" + str(index), depth + 1))
+            if len(found) >= 24:
+                break
+    elif isinstance(value, (str, int, float, bool)) or value is None:
+        if len(_json_bytes(value)) <= 800:
+            found.append((prefix, value))
+    return found
+
+
+def _professional_preview(item: dict[str, Any]) -> dict[str, Any]:
+    paths = _scalar_paths(item)
+    preferred = (
+        "/record/title", "/record/name", "/record/company_name", "/record/companyName",
+        "/record/公司名称", "/record/企业名称", "/record/企业全称",
+        "/record/risk_level", "/record/risk_type", "/record/risk_name", "/record/risk_status",
+        "/record/风险等级", "/record/风险类型", "/record/风险事项", "/record/风险描述",
+        "/record/企业状态", "/record/status", "/record/经营状态",
+        "/record/成立日期", "/record/统一社会信用代码", "/record/公司ID",
+        "/record/series_name", "/record/indicator_name", "/record/time_raw", "/record/unit_raw",
+        "/record/report_title", "/record/summary", "/record/description",
+        "/record/abstract", "/record/conclusion",
+    )
+    by_path = dict(paths)
+    selected = [path for path in preferred if path in by_path]
+    for path, _value in paths:
+        if path not in selected:
+            selected.append(path)
+        if len(selected) >= 4:
+            break
+    fields = [{"field_path": path, "value": by_path[path]} for path in selected[:4]]
+    excerpt = ""
+    for path in selected:
+        value = by_path[path]
+        if isinstance(value, str) and value.strip():
+            excerpt = value.strip()[:180]
+            break
+    return {"field_paths": selected[:4], "excerpt": excerpt, "fields": fields}
+
+
+def _professional_source(item: dict[str, Any]) -> dict[str, Any]:
+    """从供应商原记录提取已有来源字段，不补造链接或日期含义。
+
+    返回值随候选证据保存并用于页面；核准日期与统计期不冒充发布时间。
+    """
+    nested = item.get("source") if isinstance(item.get("source"), dict) else {}
+    aliases = {
+        "url": ("url", "source_url", "link"),
+        "provider": ("provider", "publisher", "source_name"),
+        "record_id": ("record_id", "source_id", "company_id", "enterprise_id",
+                      "unified_social_credit_code", "social_credit_code", "credit_code", "uscc",
+                      "统一社会信用代码", "公司ID", "企业ID", "id"),
+        "published_at": ("published_at", "publish_date", "published_date", "date_published"),
+        "source_system": ("source_system",),
+        "dataset_id": ("dataset_id",),
+        "statistical_period": ("time_raw", "period", "reporting_period"),
+        "unit": ("unit_raw", "unit", "measurement_unit", "currency"),
+    }
+
+    def find(names: tuple[str, ...]):
+        for container, prefix in ((nested, "source"), (item, "record")):
+            for name in names:
+                value = container.get(name)
+                if value not in (None, ""):
+                    return name, value, f"/{prefix}/{name}"
+        return None, None, None
+
+    source: dict[str, Any] = {}
+    missing: list[str] = []
+    for target, names in aliases.items():
+        field_name, value, _field_path = find(names)
+        if target == "provider" and value is None:
+            value = "DataPro"
+        if target == "url" and value is not None:
+            if not isinstance(value, str) or not value.lower().startswith(("https://", "http://")):
+                value = None
+                missing.append("url_invalid")
+        if isinstance(value, str):
+            max_chars = 1_000 if target == "url" else 300
+            value = redact(value[:max_chars])
+        elif value is not None and not isinstance(value, (int, float, bool)):
+            value = None
+            missing.append(target + "_invalid")
+        source[target] = value
+        if target == "published_at":
+            source["published_at_field"] = field_name
+        if value is None:
+            missing.append(target)
+
+    time_aliases = (
+        "published_at", "publish_date", "published_date", "date_published", "date",
+        "time_raw", "p_date", "approval_date", "approved_date", "核准日期",
+        "valid_from", "validity_start", "validity_start_date", "有效期起", "有效期自",
+        "valid_to", "validity_end", "validity_end_date", "有效期止", "有效期至",
+        "year", "年份", "年度",
+    )
+    time_fields = []
+    seen_paths = set()
+    for container, prefix in ((nested, "source"), (item, "record")):
+        for name in time_aliases:
+            value = container.get(name)
+            field_path = f"/{prefix}/{name}"
+            if value in (None, "") or field_path in seen_paths:
+                continue
+            if isinstance(value, str):
+                safe_value = redact(value[:300])
+            elif isinstance(value, (int, float, bool)):
+                safe_value = value
+            else:
+                continue
+            time_fields.append({"field": name, "field_path": field_path, "value": safe_value})
+            seen_paths.add(field_path)
+    source["time_fields"] = time_fields
+    year_name, year_value, _year_path = find(("year", "年份", "年度"))
+    if isinstance(year_value, str):
+        year_value = redact(year_value[:100])
+    elif year_value is not None and not isinstance(year_value, (int, float, bool)):
+        year_value = None
+    source["year"] = year_value
+    source["year_field"] = year_name
+    source["missing_fields"] = sorted(set(missing))
+    return source
+
+
+def _save_professional_record(
+    ctx: dict[str, Any], *, category: str, query: str, trace_id: str | None,
+    dataset_type: str | None, route_verified: bool, item: dict[str, Any],
+    query_evidence_id: str, limitations: list[str], item_index: int | None = None,
+    source_event_id: str | None = None, grant: bool = True,
+) -> str:
+    safe_item = _clean_provider_data(item)
+    source = _professional_source(safe_item)
+    data = {
+        "category": category,
+        "dataset_type": dataset_type,
+        "query": query,
+        "trace_id": trace_id,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "item_index": item_index,
+        "record": safe_item,
+        "source": source,
+        "route_verified": route_verified,
+        "limitations": list(limitations),
+        "query_evidence_id": query_evidence_id,
+        "dependency_evidence_ids": [query_evidence_id],
+    }
+    return _save_evidence(ctx, "professional_record", data, event_id=source_event_id, grant=grant)
 
 
 def _path_value(data: dict[str, Any], dotted_path: str) -> Any:
@@ -198,6 +565,240 @@ def _search_jobs(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _query_professional_data(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """args 是模型提出且已校验的类别与查询；ctx 来自主循环。
+
+    调用客户端后检查业务状态，保存查询快照与候选证据，返回短索引给模型。
+    索引只是定位入口，正式引用还需要 get_record 实际读取采用字段。
+    """
+    category = args["category"]
+    query = args["query"].strip()
+    if category not in _PROFESSIONAL_CATEGORIES:
+        raise ToolFailure("invalid_category", "专业资料类别不在允许范围内。")
+    if not query or len(query) > 600:
+        raise ToolFailure("invalid_query", "查询内容必须为 1 到 600 个字符。")
+
+    cache = ctx.get("data_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        ctx["data_cache"] = cache
+    cache_key = (category, query)
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict) and isinstance(cached.get("error"), dict):
+        _data_usage(ctx)["cache_hits"] += 1
+        raise ToolFailure(cached["error"]["code"], cached["error"]["message"])
+    if isinstance(cached, dict) and isinstance(cached.get("data"), dict) and isinstance(cached.get("evidence_ids"), list):
+        for evidence_id in cached["evidence_ids"]:
+            _grant(ctx, evidence_id)
+        _data_usage(ctx)["cache_hits"] += 1
+        return {"data": cached["data"], "evidence_ids": list(cached["evidence_ids"])}
+
+    prefixed_query = _PROFESSIONAL_CATEGORIES[category] + query
+    try:
+        payload = _call_data_client(ctx, category, prefixed_query)
+    except ToolFailure as exc:
+        # 同一轮连失败也复用，防止模型反复提出相同查询而重复发起付费尝试。
+        cache[cache_key] = {"error": {"code": exc.code, "message": exc.message}}
+        raise
+    try:
+        if not isinstance(payload, dict):
+            raise ToolFailure("data_structure_error", "专业资料服务返回格式无效。")
+        raw_bytes = _json_bytes(payload)
+        if len(raw_bytes) >= _MAX_DATA_RESPONSE_BYTES:
+            raise ToolFailure("data_response_too_large", "专业资料返回内容超过安全大小上限。")
+        code = payload.get("code")
+        if isinstance(code, bool) or code not in (0, "0"):
+            raise ToolFailure("data_business_error", "专业资料查询未成功，本轮没有引用该结果。")
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise ToolFailure("data_structure_error", "专业资料服务没有返回候选记录列表。")
+        if not items:
+            raise ToolFailure("data_empty", "没有找到可引用的专业资料记录。")
+        if any(not isinstance(item, dict) for item in items):
+            raise ToolFailure("data_structure_error", "专业资料候选记录格式无效。")
+        if not any(_professional_preview(item)["field_paths"] for item in items):
+            raise ToolFailure("data_structure_error", "专业资料候选没有可索引的业务字段。")
+
+        dataset_type = payload.get("dataset_type")
+        dataset_type = dataset_type[:120] if isinstance(dataset_type, str) else None
+        normalized_type = _normalized_dataset_category(dataset_type)
+        if normalized_type and normalized_type != category:
+            raise ToolFailure("data_wrong_type", "返回资料类别与请求类别不匹配。")
+        route_verified = normalized_type == category
+        limitations: list[str] = []
+        if not route_verified:
+            limitations.append("返回资料类型未映射到已核验类别，不能单独作为充分事实。")
+        trace_id = payload.get("trace_id")
+        trace_id = redact(trace_id[:200]) if isinstance(trace_id, str) else None
+        clean_payload = _clean_provider_data(payload)
+        clean_bytes = _json_bytes(clean_payload)
+        if len(clean_bytes) >= _MAX_DATA_RESPONSE_BYTES:
+            raise ToolFailure("data_response_too_large", "脱敏后的专业资料超过安全大小上限。")
+    except ToolFailure as exc:
+        usage = _data_usage(ctx)
+        usage["failed"] += 1
+        _record_data_failure(ctx, category, exc.code)
+        cache[cache_key] = {"error": {"code": exc.code, "message": exc.message}}
+        raise
+
+    usage = _data_usage(ctx)
+    usage["success"] += 1
+    snapshot_data = {
+        "category": category,
+        "query": query,
+        "trace_id": trace_id,
+        "dataset_type": dataset_type,
+        "route_verified": route_verified,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "response_sha256": hashlib.sha256(clean_bytes).hexdigest(),
+        "response": clean_payload,
+        "limitations": list(limitations),
+    }
+    snapshot_id = _save_evidence(ctx, "professional_query", snapshot_data)
+
+    source_event_id = ctx.get("current_event_id")
+    candidate_ids: list[str] = []
+    for item_index, item in enumerate(items):
+        source = _professional_source(_clean_provider_data(item))
+        record_limitations = list(limitations)
+        if source["missing_fields"]:
+            record_limitations.append("来源元数据缺失：" + "、".join(source["missing_fields"]))
+        candidate_ids.append(_save_professional_record(
+            ctx, category=category, query=query, trace_id=trace_id,
+            dataset_type=dataset_type, route_verified=route_verified, item=item,
+            query_evidence_id=snapshot_id, limitations=record_limitations,
+            item_index=item_index, source_event_id=source_event_id, grant=False,
+        ))
+
+    index_data: dict[str, Any] = {
+        "category": category,
+        "query_evidence_id": snapshot_id,
+        "dataset_type": dataset_type,
+        "route_verified": route_verified,
+        "items": [],
+        "limitations": list(limitations),
+        "more_items_path_prefix": "/response/items/",
+    }
+    evidence_ids = [snapshot_id]
+    for item_index, item in enumerate(items):
+        preview = _professional_preview(item)
+        if not preview["field_paths"]:
+            continue
+        row = {
+            "evidence_id": candidate_ids[item_index],
+            "field_paths": preview["field_paths"],
+            "excerpt": preview["excerpt"][:120],
+        }
+        trial = {**index_data, "items": [*index_data["items"], row]}
+        trial_ids = [*evidence_ids, row["evidence_id"]]
+        # Include the complete tool-result envelope in the 1,500-character limit.
+        envelope = {"ok": True, "data": trial, "error": None, "evidence_ids": trial_ids}
+        if len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))) > _MAX_PROFESSIONAL_INDEX_CHARS:
+            if not index_data["items"]:
+                row["field_paths"] = row["field_paths"][:1]
+                row["excerpt"] = row["excerpt"][:40]
+                trial["items"] = [row]
+                envelope["data"] = trial
+                envelope["evidence_ids"] = trial_ids
+                if len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))) > _MAX_PROFESSIONAL_INDEX_CHARS:
+                    continue
+            else:
+                break
+
+        record_id = candidate_ids[item_index]
+        _grant(ctx, record_id)
+        index_data["items"].append(row)
+        evidence_ids.append(record_id)
+
+    data = index_data
+    if len(json.dumps({"ok": True, "data": data, "error": None, "evidence_ids": evidence_ids},
+                      ensure_ascii=False, separators=(",", ":"))) > _MAX_PROFESSIONAL_INDEX_CHARS:
+        # This should be unreachable because each candidate was checked before saving.
+        raise ToolFailure("data_index_too_large", "专业资料索引超过安全大小上限。")
+    cache[cache_key] = {"data": data, "evidence_ids": list(evidence_ids)}
+    return {"data": data, "evidence_ids": evidence_ids}
+
+
+def _professional_record_preview(record: dict[str, Any]) -> dict[str, Any]:
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    item = data.get("record") if isinstance(data.get("record"), dict) else {}
+    preview = _professional_preview(item)
+    return {
+        "id": record.get("id"), "kind": record.get("kind"),
+        "category": data.get("category"), "dataset_type": data.get("dataset_type"),
+        "route_verified": data.get("route_verified"), "source": data.get("source"),
+        "field_paths": preview["field_paths"], "excerpt": preview["excerpt"],
+        "limitations": data.get("limitations", []),
+    }
+
+
+def _get_professional_record(ctx: dict[str, Any], record: dict[str, Any], field_path: str | None):
+    """把会话内保存的资料变成有长度上限的工具结果，不执行原文中的指令。
+
+    整条记录过大时只提供预览；模型可用字段路径继续读取，避免把全文塞进上下文。
+    """
+    data = record["data"]
+    if record.get("kind") == "professional_query":
+        response = data.get("response") if isinstance(data.get("response"), dict) else {}
+        items = response.get("items") if isinstance(response.get("items"), list) else []
+        if not field_path:
+            return {
+                "id": record.get("id"), "kind": record.get("kind"),
+                "category": data.get("category"), "dataset_type": data.get("dataset_type"),
+                "route_verified": data.get("route_verified"), "trace_id": data.get("trace_id"),
+                "fetched_at": data.get("fetched_at"), "response_sha256": data.get("response_sha256"),
+                "item_count": len(items), "limitations": data.get("limitations", []),
+                "field_path_example": "/response/items/0",
+            }
+
+        tokens = _json_pointer_tokens(field_path)
+        if (len(tokens) == 3 and tokens[0] == "response" and tokens[1] == "items"
+                and re.fullmatch(r"0|[1-9][0-9]*", tokens[2])):
+            item_index = int(tokens[2])
+            if item_index >= len(items) or not isinstance(items[item_index], dict):
+                raise ToolFailure("field_not_found", "字段路径在该查询快照中不存在。")
+            store = _store()
+            existing = store.list_evidence(_session(ctx)[2], _session(ctx)[0], record.get("turn_id"))
+            candidate_id = None
+            for item in existing:
+                candidate_data = _dict_data(item)
+                if (item.get("kind") == "professional_record" and candidate_data
+                        and candidate_data.get("query_evidence_id") == record.get("id")
+                        and candidate_data.get("item_index") == item_index):
+                    candidate_id = item.get("id")
+                    break
+            if candidate_id is None:
+                limitations = list(data.get("limitations", []))
+                source = _professional_source(items[item_index])
+                if source["missing_fields"]:
+                    limitations.append("来源元数据缺失：" + "、".join(source["missing_fields"]))
+                candidate_id = _save_professional_record(
+                    ctx, category=data["category"], query=data.get("query", ""),
+                    trace_id=data.get("trace_id"), dataset_type=data.get("dataset_type"),
+                    route_verified=bool(data.get("route_verified")), item=items[item_index],
+                    query_evidence_id=record["id"], limitations=limitations, item_index=item_index,
+                    source_event_id=record.get("event_id"),
+                )
+            _grant(ctx, candidate_id)
+            candidate = _evidence(ctx, candidate_id)
+            return _professional_record_preview(candidate)
+
+        return {"id": record.get("id"), "field_path": field_path,
+                "value": _json_pointer_value(data, field_path)}
+
+    if record.get("kind") != "professional_record":
+        if field_path:
+            raise ToolFailure("field_selection_unsupported", "字段选择只适用于专业资料依据。")
+        return record
+    if field_path:
+        return {"id": record.get("id"), "kind": record.get("kind"),
+                "field_path": field_path, "value": _json_pointer_value(data, field_path)}
+
+    if _json_chars(record) <= _MAX_PROFESSIONAL_RECORD_CHARS:
+        return record
+    return _professional_record_preview(record)
+
+
 def _get_record(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     session_id, _, db_path = _session(ctx)
     store = _store()
@@ -210,6 +811,35 @@ def _get_record(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         granted = _dependency_closure(ctx, [record_id], grant_discovered=True)
         for item in granted:
             _grant(ctx, item)
+        field_path = args.get("field_path")
+        if record.get("kind") in {"professional_query", "professional_record"}:
+            visible_record = _get_professional_record(ctx, record, field_path)
+            extra_ids: list[str] = []
+            if isinstance(visible_record, dict):
+                selected_id = visible_record.get("id")
+                if isinstance(selected_id, str) and selected_id != record_id:
+                    _grant(ctx, selected_id)
+                    extra_ids = _dependency_closure(ctx, [selected_id], grant_discovered=True)
+            result = {"data": {"record_type": record_type, "record": visible_record},
+                      "evidence_ids": list(dict.fromkeys(granted + extra_ids + [record.get("id")]))}
+            result_ids = result["evidence_ids"]
+            envelope = {"ok": True, "data": result["data"], "error": None, "evidence_ids": result_ids}
+            if _json_chars(envelope) > _MAX_PROFESSIONAL_RECORD_CHARS:
+                if not field_path and record.get("kind") == "professional_record":
+                    result["data"]["record"] = _professional_record_preview(record)
+                envelope["data"] = result["data"]
+                if _json_chars(envelope) > _MAX_PROFESSIONAL_RECORD_CHARS:
+                    raise ToolFailure("field_too_large", "Professional record response exceeds the size limit; select a smaller field.")
+            # 授权 ID 不等于读过字段。只标记这次实际回传给模型的完整字段或子树。
+            visible_record = result["data"]["record"]
+            if visible_record.get("kind") == "professional_record":
+                if "data" in visible_record:
+                    _mark_professional_read(ctx, visible_record["id"], "/record")
+                elif "value" in visible_record and "field_path" in visible_record:
+                    _mark_professional_read(ctx, visible_record["id"], visible_record["field_path"])
+            return result
+        if field_path:
+            raise ToolFailure("field_selection_unsupported", "字段选择只适用于专业资料依据。")
         return {"data": {"record_type": record_type, "record": record}, "evidence_ids": granted}
 
     recommendation = store.get_recommendation(db_path, session_id, record_id)
@@ -349,6 +979,17 @@ def _record_condition(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, An
     original = message.get("content")
     if not isinstance(original, str) or quote not in original:
         raise ToolFailure("quote_mismatch", "引用内容必须逐字出现在本会话的用户原话中。")
+    supersedes_id = args.get("supersedes_evidence_id")
+    superseded = None
+    if supersedes_id:
+        supersedes_id = _require_id(supersedes_id, "待替代条件")
+        if supersedes_id not in ctx.get("allowed_evidence_ids", set()):
+            raise ToolFailure("evidence_not_allowed", "只能替代本轮已读取的同会话条件记录。")
+        superseded = _evidence(ctx, supersedes_id)
+        old_data = superseded["data"]
+        if (superseded.get("kind") != "user_condition" or old_data.get("field") != args["field"]
+                or old_data.get("status") not in {"自述", "待确认", "已核验"}):
+            raise ToolFailure("invalid_superseded_condition", "只能关联同字段的既有用户条件，原记录不会被覆盖。")
     condition = {
         "field": args["field"],
         "quote": quote,
@@ -357,6 +998,10 @@ def _record_condition(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, An
         "source_message_turn_id": message.get("turn_id"),
         "protection": "用户自述与测评结果分开保存，不会覆盖测评分数。",
     }
+    if superseded:
+        condition["supersedes_evidence_id"] = superseded["id"]
+        condition["superseded_source_message_id"] = superseded["data"].get("source_message_id")
+        condition["dependency_evidence_ids"] = [superseded["id"]]
     evidence_id = _save_evidence(ctx, "user_condition", condition)
     return {"data": {"condition": condition, "evidence_id": evidence_id}, "evidence_ids": [evidence_id]}
 
@@ -367,6 +1012,10 @@ _CLARIFYING_QUESTIONS = {
     "location": "你希望在哪个城市或地区学习、实习或工作？",
     "availability": "你每周大约能投入几天，什么时候可以开始？",
     "goal": "你现阶段最想优先解决什么：探索方向、寻找实习，还是准备求职？",
+    "company": "你想了解哪家企业？请提供企业全称或可核对的企业标识。",
+    "industry": "你想比较哪个行业、地区或时间范围？",
+    "job_description": "请提供岗位名称或岗位描述，说明你最想核实的要求。",
+    "offer_terms": "你想评估哪些录用条件？可以说明岗位、地点、薪酬结构或需要核实的条款。",
 }
 
 
@@ -398,11 +1047,7 @@ def _submit_recommendation(ctx: dict[str, Any], args: dict[str, Any]) -> dict[st
     # 推荐说明只写定性理由；数字与百分数由程序的 computed 字段展示，
     # 防止模型复制错误分数或自行制造概率。依据原文中的数字仍保留在账本。
     free_text_fields = [args["title"], args["explanation"], args["next_action"], *args["limitations"]]
-    if any(
-        any(character.isdigit() or character in "%％" for character in text)
-        or "百分之" in text
-        for text in free_text_fields
-    ):
+    if _contains_free_text_number(free_text_fields):
         raise ToolFailure("numeric_claim_not_allowed", "自由文本不能包含数字或百分号；匹配数值由程序单独展示。")
 
     required_ids = _dependency_closure(ctx, [calculation_id])
@@ -451,6 +1096,181 @@ def _submit_recommendation(ctx: dict[str, Any], args: dict[str, Any]) -> dict[st
     }
 
 
+_CHINESE_NUMERALS = "零〇一二两三四五六七八九十百千万亿点半"
+_CHINESE_NUMBER_RE = re.compile(
+    rf"(?:百分之[{_CHINESE_NUMERALS}]+|[{_CHINESE_NUMERALS}]+"
+    rf"(?:万元|亿元|千元|百元|万|亿|千|百|成|折|倍|元|人|岁|个|家|项|年|月|天|季度|小时|分钟|公里|级|名|多|余))"
+)
+
+
+def _mark_professional_read(ctx: dict[str, Any], evidence_id: str, field_path: str) -> None:
+    """记录本轮已回传的字段范围，只保留 ID 与路径，不复制资料。"""
+    reads = ctx.setdefault("professional_reads", set())
+    reads.add((evidence_id, tuple(_json_pointer_tokens(field_path))))
+
+
+def _professional_field_was_read(ctx: dict[str, Any], evidence_id: str, field_path: str) -> bool:
+    tokens = tuple(_json_pointer_tokens(field_path))
+    return any(read_id == evidence_id and tokens[:len(prefix)] == prefix
+               for read_id, prefix in ctx.get("professional_reads", set()))
+
+
+def _contains_free_text_number(values: list[str]) -> bool:
+    return any(
+        any(character.isdigit() or character in "%％" for character in value)
+        or _CHINESE_NUMBER_RE.search(value) is not None
+        for value in values
+    )
+
+
+def _submit_decision(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """模型提出理由与引用，程序核对来源、已读字段及执行事件后保存建议。
+
+    事实值从账本取出，生成标签不能替换原文。返回建议 ID 供主循环发布与页面展示。
+    """
+    session_id, turn_id, db_path = _session(ctx)
+    free_text = [args["title"], *args["options"], *args["unknowns"], *args["next_actions"]]
+    free_text.extend(claim["text"] for claim in args["claims"] if claim["kind"] == "inference")
+    if _contains_free_text_number(free_text):
+        raise ToolFailure("numeric_claim_not_allowed", "自由文本不能包含数字；已引用事实的数值由程序单独展示。")
+
+    resolved_claims: list[dict[str, Any]] = []
+    cited_ids: list[str] = []
+    successful_professional_ids: set[str] = set()
+    limitations: list[str] = []
+    for claim in args["claims"]:
+        kind = claim["kind"]
+        citations = claim["citations"]
+        if not citations:
+            raise ToolFailure("missing_citation", "每条决策理由都必须关联可读取的依据。")
+        resolved: list[dict[str, Any]] = []
+        for citation in citations:
+            evidence_id = _require_id(citation["evidence_id"], "依据")
+            field_path = citation["field_path"]
+            if evidence_id not in ctx.get("allowed_evidence_ids", set()):
+                raise ToolFailure("evidence_not_allowed", "理由引用了本轮没有读取或授权的依据。")
+            record = _evidence(ctx, evidence_id)
+            data = record["data"]
+            evidence_kind = record.get("kind")
+
+            if evidence_kind == "professional_record":
+                if kind == "user_statement":
+                    raise ToolFailure("wrong_citation_kind", "用户自述理由只能引用本会话保存的用户原话。")
+                if not field_path.startswith("/record/"):
+                    raise ToolFailure("invalid_citation_path", "专业事实只能引用候选记录中的具体字段。")
+                if not data.get("route_verified") and kind == "fact":
+                    raise ToolFailure("unverified_data_route", "资料类型尚未核实，不能作为已确认事实提交。")
+                value = _json_pointer_value(data, field_path)
+                if value is None or value == "" or value == []:
+                    raise ToolFailure("citation_empty", "The cited field is empty.")
+                if isinstance(value, dict):
+                    raise ToolFailure("citation_too_broad", "Cite a leaf field instead of a record object.")
+                if isinstance(value, list):
+                    if (any(isinstance(item, (dict, list)) for item in value)
+                            or len(_json_bytes(value)) > 600):
+                        raise ToolFailure("citation_too_broad", "Scalar arrays must fit within 600 bytes.")
+                elif isinstance(value, str) and len(value) > 1_200:
+                    raise ToolFailure("citation_too_broad", "Cited text fields are limited to 1,200 characters.")
+                query_id = data.get("query_evidence_id")
+                if not isinstance(query_id, str):
+                    raise ToolFailure("invalid_professional_source", "专业记录没有对应的查询快照。")
+                query_record = _evidence(ctx, query_id)
+                if query_record.get("kind") != "professional_query":
+                    raise ToolFailure("invalid_professional_source", "专业记录的查询来源无效。")
+                if query_record.get("turn_id") != record.get("turn_id"):
+                    raise ToolFailure("invalid_professional_source", "专业记录与查询快照轮次不一致。")
+                event_id = record.get("event_id")
+                event = _store().get_event(db_path, session_id, event_id) if event_id else None
+                if (not event or event.get("status") != "success"
+                        or event.get("tool_name") != "query_professional_data"
+                        or event.get("turn_id") != record.get("turn_id")):
+                    raise ToolFailure("source_event_incomplete", "引用的专业查询尚未成功完成。")
+                query_event_id = query_record.get("event_id")
+                query_event = _store().get_event(db_path, session_id, query_event_id) if query_event_id else None
+                if (not query_event or query_event.get("status") != "success"
+                        or query_event.get("tool_name") != "query_professional_data"
+                        or query_event.get("turn_id") != query_record.get("turn_id")):
+                    raise ToolFailure("source_event_incomplete", "专业资料查询快照尚未成功完成。")
+                if not _professional_field_was_read(ctx, evidence_id, field_path):
+                    raise ToolFailure("field_not_read", "请先用 get_record 读取该具体字段，再提交引用。")
+                successful_professional_ids.add(evidence_id)
+                if not data.get("route_verified"):
+                    limitation = "存在资料类型未核实的候选记录，不能作为事实依据。"
+                    if limitation not in limitations:
+                        limitations.append(limitation)
+                source = data.get("source") if isinstance(data.get("source"), dict) else {}
+                missing = source.get("missing_fields", [])
+                for item_limitation in data.get("limitations", []):
+                    if isinstance(item_limitation, str) and item_limitation not in limitations:
+                        limitations.append(item_limitation)
+                if missing:
+                    limitation = "部分引用资料缺少来源元数据：" + "、".join(str(item) for item in missing[:5])
+                    if limitation not in limitations:
+                        limitations.append(limitation)
+            elif evidence_kind in {"user_input", "user_condition"}:
+                if kind == "fact":
+                    raise ToolFailure("wrong_citation_kind", "用户自述不能作为外部事实引用。")
+                if field_path != "/quote" or not isinstance(data.get("quote"), str):
+                    raise ToolFailure("invalid_citation_path", "用户自述只能引用已保存的原话字段。")
+                value = _json_pointer_value(data, field_path)
+            else:
+                raise ToolFailure("wrong_citation_kind", "该记录类型不能作为通用决策理由的直接引用。")
+
+            if kind == "user_statement" and evidence_kind not in {"user_input", "user_condition"}:
+                raise ToolFailure("wrong_citation_kind", "用户自述理由只能引用本会话保存的用户原话。")
+
+            if evidence_kind != "professional_record" and _json_chars(value) > 600:
+                raise ToolFailure("citation_too_broad", "Cited user quote is too long.")
+            cited_ids.append(evidence_id)
+            resolved.append({"evidence_id": evidence_id, "field_path": field_path, "value": value})
+
+        resolved_claims.append({
+            "kind": kind,
+            "text": ("引用字段：" + "、".join(citation["field_path"].rsplit("/", 1)[-1]
+                                                for citation in claim["citations"])
+                     if kind == "fact" else "用户原话" if kind == "user_statement" else claim["text"]),
+            **({"generated_label": claim["text"]} if kind == "fact" else {}),
+            "citations": [{"evidence_id": item["evidence_id"], "field_path": item["field_path"]}
+                          for item in resolved],
+            "resolved": resolved,
+            "origin": "model_generated" if kind == "inference" else
+                      "user_statement" if kind == "user_statement" else "source_derived",
+        })
+
+    if not successful_professional_ids:
+        raise ToolFailure("professional_evidence_required", "通用决策至少需要一条查询成功的专业资料记录。")
+
+    for failure in ctx.get("data_failures", []) if isinstance(ctx.get("data_failures"), list) else []:
+        if not isinstance(failure, dict):
+            continue
+        category = failure.get("category", "professional")
+        code = failure.get("code", "data_error")
+        limitation = f"本轮 {category} 资料查询未成功（{code}）；相关信息尚未核实。"
+        if limitation not in limitations:
+            limitations.append(limitation)
+
+    evidence_ids = list(dict.fromkeys(cited_ids))
+    closure = _dependency_closure(ctx, evidence_ids)
+    data = {
+        "kind": "career_decision",
+        "title": args["title"],
+        "options": list(args["options"]),
+        "claims": resolved_claims,
+        "unknowns": list(args["unknowns"]),
+        "next_actions": list(args["next_actions"]),
+        "limitations": limitations,
+        "evidence_ids": closure,
+        "turn_id": turn_id,
+    }
+    recommendation_id = _store().add_recommendation(db_path, session_id, turn_id, data)
+    if isinstance(ctx.get("pending_recommendations"), list):
+        ctx["pending_recommendations"].append(recommendation_id)
+    return {
+        "data": {"recommendation_id": recommendation_id, "recommendation": data},
+        "evidence_ids": closure,
+    }
+
+
 def _object_schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
 
@@ -477,6 +1297,7 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
         "parameters": _object_schema({
             "record_type": {"type": "string", "enum": ["evidence", "recommendation"]},
             "record_id": _ID_SCHEMA,
+            "field_path": {"type": "string", "minLength": 1, "maxLength": 300},
         }, ["record_type", "record_id"]),
         "permission": "business_read",
         "handler": _get_record,
@@ -498,6 +1319,7 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
             "field": {"type": "string", "minLength": 1, "maxLength": 60},
             "quote": {"type": "string", "minLength": 1, "maxLength": 300},
             "status": {"type": "string", "enum": ["自述", "待确认"]},
+            "supersedes_evidence_id": _ID_SCHEMA,
         }, ["source_message_id", "field", "quote", "status"]),
         "permission": "business_write",
         "handler": _record_condition,
@@ -515,6 +1337,38 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
         "permission": "business_write",
         "handler": _submit_recommendation,
     },
+    "query_professional_data": {
+        "description": "按类别查询受限的专业资料；返回已索引候选及依据编号，更多候选可按查询快照的 JSON Pointer 读取。",
+        "parameters": _object_schema({
+            "category": {"type": "string", "enum": list(_PROFESSIONAL_CATEGORIES)},
+            "query": {"type": "string", "minLength": 1, "maxLength": 600},
+        }, ["category", "query"]),
+        "permission": "business_read",
+        "handler": _query_professional_data,
+    },
+    "submit_decision": {
+        "description": "提交通用决策。事实值由引用字段自动解析；fact 标签由程序按字段名生成，user_statement 固定显示用户原话，只有 inference 的 text 会展示为模型推论。不要在标签中重写来源数字。",
+        "parameters": _object_schema({
+            "title": {"type": "string", "minLength": 1, "maxLength": 120},
+            "options": {"type": "array", "minItems": 1, "maxItems": 4,
+                         "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+            "claims": {"type": "array", "minItems": 1, "maxItems": 12, "items": _object_schema({
+                "kind": {"type": "string", "enum": ["fact", "user_statement", "inference"]},
+                "text": {"type": "string", "minLength": 1, "maxLength": 300, "description": "fact/user_statement 的 text 不展示，标签由程序生成；仅为 inference 填写会展示的推论描述。"},
+                "citations": {"type": "array", "minItems": 1, "maxItems": 6,
+                              "items": _object_schema({
+                                  "evidence_id": _ID_SCHEMA,
+                                  "field_path": {"type": "string", "minLength": 1, "maxLength": 300},
+                              }, ["evidence_id", "field_path"])},
+            }, ["kind", "text", "citations"])},
+            "unknowns": {"type": "array", "maxItems": 12,
+                         "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+            "next_actions": {"type": "array", "maxItems": 8,
+                             "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+        }, ["title", "options", "claims", "unknowns", "next_actions"]),
+        "permission": "business_write",
+        "handler": _submit_decision,
+    },
     "ask_user": {
         "description": "从固定问题库中挑选澄清问题；不能传入自拟问题文本。主循环应把结果作为待用户回答的问题。",
         "parameters": _object_schema({
@@ -523,7 +1377,8 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "minItems": 1,
                 "maxItems": 5,
                 "uniqueItems": True,
-                "items": {"type": "string", "enum": ["skills", "experience", "location", "availability", "goal"]},
+                "items": {"type": "string", "enum": ["skills", "experience", "location", "availability", "goal",
+                                                           "company", "industry", "job_description", "offer_terms"]},
             },
         }, ["fields"]),
         "permission": "business_read",

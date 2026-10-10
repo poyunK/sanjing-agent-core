@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from sanjing import context, model, store
 from sanjing.agent import run_turn
+from sanjing.config import MAX_STEPS
 
 
 class CoreTests(unittest.TestCase):
@@ -79,12 +80,12 @@ class CoreTests(unittest.TestCase):
 
     def test_content_and_multiple_calls_pair_correctly(self):
         responses = []
-        for index in range(6):
+        for index in range(MAX_STEPS):
             responses.append({"message": {"role": "assistant", "content": "这不是最终答案", "tool_calls": [
                 {"id": f"call_{index}_a", "type": "function", "function": {"name": "run_shell", "arguments": '{}'}},
                 {"id": f"call_{index}_b", "type": "function", "function": {"name": "read_key", "arguments": '{}'}}]}, "usage": {}})
         def fake(messages, tools):
-            if len(responses) < 6:
+            if len(responses) < MAX_STEPS:
                 self.assertEqual(messages[-1]["role"], "tool")
                 self.assertEqual(messages[-2]["role"], "tool")
                 self.assertEqual(messages[-3]["role"], "assistant")
@@ -94,7 +95,7 @@ class CoreTests(unittest.TestCase):
         result = run_turn(self.session, "合成拦截案例", db_path=self.db, client=fake)
         self.assertEqual(result["error_code"], "STEP_LIMIT")
         snap = store.snapshot(self.db, self.session, result["turn_id"])
-        self.assertEqual(len(snap["events"]), 12)
+        self.assertEqual(len(snap["events"]), MAX_STEPS * 2)
         self.assertFalse(store.list_recommendations(self.db, self.session))
 
     def test_duplicate_call_id_stops_before_execution(self):

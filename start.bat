@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
+set "PYTHONUTF8=1"
 cd /d "%~dp0"
 
 set "PY_CMD="
@@ -28,9 +29,10 @@ if not defined PY_CMD (
 echo.
 echo ===== 三镜 Agent 教学原型 =====
 echo 1. 离线教学模式（不需要 Key，不请求网络）
-echo 2. 真实 DeepSeek 对话
+echo 2. 真实 DeepSeek＋专业数据集对话
 echo 3. 恢复真实会话
 echo 4. 查看最近账本
+echo 5. 专业查询离线练习（合成资料，不需要 Key）
 echo 0. 退出
 set "CHOICE="
 set /p "CHOICE=请输入编号并按回车："
@@ -49,6 +51,10 @@ if "%CHOICE%"=="3" (
 )
 if "%CHOICE%"=="4" (
     call %PY_CMD% -m sanjing.cli --show-latest --open-latest
+    goto menu
+)
+if "%CHOICE%"=="5" (
+    call %PY_CMD% -m sanjing.cli --professional-demo --trace
     goto menu
 )
 if "%CHOICE%"=="0" exit /b 0

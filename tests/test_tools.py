@@ -201,7 +201,7 @@ class ToolsIntegrationTests(unittest.TestCase):
         names = {item["function"]["name"] for item in definitions}
         self.assertEqual(names, {
             "get_assessment", "search_jobs", "get_record", "match_job",
-            "record_condition", "submit_recommendation", "ask_user",
+            "record_condition", "submit_recommendation", "ask_user", "query_professional_data", "submit_decision",
         })
 
         blocked_handler = unittest.mock.Mock()
@@ -388,7 +388,7 @@ class ToolsIntegrationTests(unittest.TestCase):
             subprocess_popen.assert_not_called()
         self.assertEqual(
             {item["function"]["name"] for item in tools.tool_definitions()},
-            {"get_assessment", "search_jobs", "get_record", "match_job", "record_condition", "submit_recommendation", "ask_user"},
+            {"get_assessment", "search_jobs", "get_record", "match_job", "record_condition", "submit_recommendation", "ask_user", "query_professional_data", "submit_decision"},
         )
 
     def test_unexpected_exception_is_hidden_from_model_result(self):

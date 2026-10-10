@@ -11,7 +11,8 @@ def _reply(calls):
         tool_calls.append({"id": new_id("call"), "type": "function", "function": {
             "name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}})
     return {"message": {"role": "assistant", "content": "离线模拟：正在请求工具。",
-                        "tool_calls": tool_calls}, "usage": {}}
+                        "tool_calls": tool_calls},
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
 
 def ask_offline(messages, tools):

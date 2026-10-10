@@ -1,4 +1,4 @@
-"""延续教材 json → bytes → HTTP；此模块是唯一读取实际密钥的地方。"""
+"""延续教材 json → bytes → HTTP；这里只读取 DeepSeek 密钥。"""
 
 import json
 import socket
@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 
 from .config import API_URL, KEY_FILE, MAX_OUTPUT_TOKENS, MODEL_NAME, TIMEOUT_SECONDS
+from .privacy import redact
 
 
 class ModelError(Exception):
@@ -41,8 +42,11 @@ def parse_response(data):
         raise ModelError("BAD_RESPONSE") from None
 
 
-def ask_llm(messages, tools, *, model=MODEL_NAME, key_file=KEY_FILE):
+def ask_llm(messages, tools, *, model=MODEL_NAME, key_file=KEY_FILE, timeout_seconds=None):
     """一次调用，不重试；只返回模型消息与用量，不返回请求头或密钥。"""
+    timeout = TIMEOUT_SECONDS if timeout_seconds is None else min(TIMEOUT_SECONDS, timeout_seconds)
+    if timeout <= 0:
+        raise ModelError("TURN_TIMEOUT")
     try:
         key = key_file.read_text(encoding="utf-8-sig").strip()
     except OSError:
@@ -61,12 +65,12 @@ def ask_llm(messages, tools, *, model=MODEL_NAME, key_file=KEY_FILE):
         # urllib 的 timeout 是网络阻塞时间，不保证整次请求总时间。
         # 守护线程只负责HTTP；即使结果晚到，也不能执行工具或改变账本。
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read(2_000_001)
                 if len(raw) > 2_000_000:
                     raise ModelError("RESPONSE_TOO_LARGE")
                 data = json.loads(raw.decode("utf-8"))
-            results.put((parse_response(data), None))
+            results.put((redact(parse_response(data), secrets=(key,)), None))
         except urllib.error.HTTPError as error:
             results.put((None, "HTTP_" + str(error.code)))
         except (TimeoutError, socket.timeout):
@@ -81,7 +85,7 @@ def ask_llm(messages, tools, *, model=MODEL_NAME, key_file=KEY_FILE):
 
     threading.Thread(target=request_once, daemon=True).start()
     try:
-        result, error_code = results.get(timeout=TIMEOUT_SECONDS)
+        result, error_code = results.get(timeout=timeout)
     except queue.Empty:
         # 本地停止等待不等于供应商取消计费；不自动重试这次请求。
         raise ModelError("MODEL_TIMEOUT") from None

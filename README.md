@@ -4,7 +4,7 @@
 
 ## 启动
 
-需要 Python 3.10 或更新版本。本工程只使用 Python 标准库，不需要安装第三方包。Windows 用户可以运行 `start.bat`，选择离线教学、真实 DeepSeek、恢复会话或查看最近账本。真实模式从 `F:\#2642Agent\DeepSeekKey（UTF8）.txt` 读取密钥；密钥不会写进本工程。
+需要 Python 3.10 或更新版本。本工程只使用 Python 标准库，不需要安装第三方包。Windows 用户可以运行 `start.bat`：选项 1 为原版岗位演示，选项 5 为专业查询离线练习，选项 2 为真实 DeepSeek＋DataPro 对话。主循环继续使用 DeepSeek；火山 Key 只用于专业数据 MCP。
 
 ### 从 GitHub 下载后的第一次运行
 
@@ -12,6 +12,7 @@
 git clone https://github.com/poyunK/sanjing-agent-core.git
 Set-Location sanjing-agent-core
 python -m sanjing.cli --offline --trace
+python -m sanjing.cli --professional-demo --trace --once "比较合成企业资料"
 ```
 
 这里需要本机安装 Python 3.10 或更高版本；仓库没有打包 Python 和模型。离线模式不需要 API Key，使用手写的模拟模型观察工具与账本流程。
@@ -65,10 +66,28 @@ python -m sanjing.cli --show-latest
 
 ## 配置、状态与后续接网页
 
-模型默认 `deepseek-flash`、非思考模式，单轮最多六次模型请求，每次最多输出 1500 tokens、最多等待六十秒，不自动重试。可通过环境变量 `SANJING_MODEL` 调整模型名、`SANJING_KEY_FILE` 调整 Key 文件位置；这两个变量不需要包含密钥内容。
+模型默认 `deepseek-flash`、非思考模式，单轮最多八次模型请求，每次最多输出 1500 tokens、最多等待六十秒；专业数据最多十六次查询，每次最多六十秒，全轮最多三百秒，不自动重试。可通过环境变量 `SANJING_MODEL` 调整模型名、`SANJING_KEY_FILE` 调整 DeepSeek Key 文件位置、`SANJING_DATAPRO_KEY_FILE` 调整 DataPro Key 文件位置；这些变量只需保存文件路径。
 
-`run_turn` 返回 `completed`（结构和引用校验通过）、`needs_input`（等待补充条件）或 `incomplete`（未完成）。只有成功调用 `submit_recommendation` 才发布建议；单独输出一段模型文字会被拦截。数字由程序填充，模型的说明文字只允许定性表达。
+`run_turn` 返回 `completed`（结构和引用校验通过）、`needs_input`（等待补充条件）或 `incomplete`（未完成）。只有成功调用 `submit_recommendation` 或 `submit_decision` 才发布建议；单独输出一段模型文字会被拦截。外部事实与用户自述由程序从引用字段填入，模型的推论明确标为生成分析。
 
 本地 SQLite 保存用户原话、账目和回复。回合内的完整工具协议仅在内存中继续传回 API，历史回合只读取已发布回复和独立记录。未来接网页时，需要服务端登录与会话映射，并串行处理同一会话；本地会话 ID 不是网页登录凭证。
 
 查看本次交付的 [验证记录](验证记录.md)。运行工程无需 Node、Playwright 或第三方 Python 包；`verification/render_check.cjs` 只是开发阶段可选的浏览器验收脚本。
+
+## 专业数据的第一次运行
+
+先运行 `start.bat` 选项 5，打开终端返回的 HTML 路径，核对一条字段引用。所有离线资料均为合成样例。再配置工程外密钥文件，选择选项 2：
+
+```powershell
+$env:SANJING_KEY_FILE = 'C:\local-secrets\deepseek.txt'
+$env:SANJING_DATAPRO_KEY_FILE = 'C:\local-secrets\datapro.txt'
+python -m sanjing.cli
+```
+
+本机已有的默认位置分别是学习工作区的 DeepSeek 文件与用户 Documents 中的火山文件；从 GitHub 下载后请使用自己的文件路径。不要把文件或密钥内容放入仓库。
+
+输入示例：`请查询目标公司的登记主体与企业风险，并列出求职前需要继续核实的事项。` 专业数据不是实时招聘库；请自行提供具体公司名、城市和 JD。需要比较行业时写明地区、指标与时间范围。
+
+查询结果是候选资料。正式回复逐条展示采用字段、用户原话、模型分析、缺失项与下一步动作；历史快照保留原查询时间。真实世界的资料适用性仍需核查。
+
+阅读 [专业数据接入与教学](docs/专业数据接入与教学.md) 学习实际数据流；阅读 [专业数据验收](专业数据验收.md) 了解本次真实验证边界。`python -m verification.factual_check` 会离线回放三十个固定案例，并将结构检查与人工内容核查分别记录。
