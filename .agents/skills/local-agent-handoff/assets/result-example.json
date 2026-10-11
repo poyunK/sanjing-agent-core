@@ -1,0 +1,8 @@
+{
+  "status": "needs_context",
+  "summary": "格式示例：尚未执行实际工程工作，需要派单方提供任务范围。",
+  "decisions": [],
+  "checks": [{"command": "示例占位：未运行任何工程检查", "outcome": "not_run", "evidence": "模板文件，不代表测试结果", "exit_code": null}],
+  "remaining": ["填写实际执行结果后再调用 finish"],
+  "context_requests": ["请明确本次允许修改的文件和验收标准"]
+}

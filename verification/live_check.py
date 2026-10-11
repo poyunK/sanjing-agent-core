@@ -26,7 +26,7 @@ def main():
         if calls >= 12:
             raise model.ModelError("LIVE_BUDGET_LIMIT")
         calls += 1
-        return model.ask_llm(messages, tools)
+        return model.ask_llm(messages, tools, provider='deepseek')
 
     session = store.ensure_session(db)
     cases = [

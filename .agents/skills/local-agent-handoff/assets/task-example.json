@@ -1,0 +1,17 @@
+{
+  "sender": "codex",
+  "receiver": "deepseek-harness",
+  "mode": "review",
+  "title": "示例：只读核对依据字段的数据流",
+  "priority": "normal",
+  "goal": "只读核对专业查询候选字段如何经过读取与引用检查，最后展示到为什么页面，给出可复验的说明。",
+  "user_authorization": "示例任务，实际派单前由 Agent 替换成用户本次真实指令；此示例本身不授权执行。",
+  "context": "普通 Python 教学工程，程序验证记录关联，不宣称已证明引用支持所有自然语言推论。",
+  "confirmed_decisions": ["不调用真实 API", "不修改源码", "不给出人格测评的科学效度承诺"],
+  "read_first": ["README.md", "sanjing/tools.py", "sanjing/viewer.py"],
+  "write_scope": [],
+  "acceptance": ["引用实际函数和源码位置", "说明 get_record 与 submit_decision 的关系", "区分已核对和未知事项"],
+  "out_of_scope": ["不新增 Web 服务", "不修改规则权重", "不发布 GitHub"],
+  "external_actions": [],
+  "depends_on": []
+}

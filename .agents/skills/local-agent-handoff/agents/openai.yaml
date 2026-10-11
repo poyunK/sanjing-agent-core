@@ -1,0 +1,4 @@
+interface:
+  display_name: "本地 Agent 文件交接"
+  short_description: "任意本地 Agent 双向交接任务、核对代码版本并验收，用户只负责转交文件"
+  default_prompt: "使用 $local-agent-handoff 把这项工作打包给另一个本地 Agent，或接收它的结果并验收。"

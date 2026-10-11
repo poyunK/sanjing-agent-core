@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import context, model, store
 from .config import (DEFAULT_DB, MAX_STEPS, MAX_TOOL_CALLS_PER_STEP, MAX_USER_CHARS,
-                     TURN_TIMEOUT_SECONDS, TIMEOUT_SECONDS, MAX_DATA_REQUESTS, DATA_TIMEOUT_SECONDS)
+                     TURN_TIMEOUT_SECONDS, TIMEOUT_SECONDS, MAX_DATA_REQUESTS, DATA_TIMEOUT_SECONDS, MAX_SEARCH_REQUESTS)
 from .privacy import redact
 
 ERROR_TEXT = {
@@ -21,6 +21,7 @@ ERROR_TEXT = {
     "CONTEXT_LIMIT": "本轮上下文超过长度预算，本轮未完成。",
     "KEY_UNAVAILABLE": "无法读取指定的 Key 文件，本轮未完成。",
     "BAD_TOOL_PROTOCOL": "工具调用协议不完整，本轮未完成。",
+    "INTERRUPTED": "本轮执行占用已结束，已保留账目；旧执行不能继续发布建议。",
 }
 
 
@@ -105,8 +106,50 @@ def _request_model(client, messages, definitions, deadline):
     return result
 
 
-def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=None,
-             trace=False, on_progress=None):
+def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=None, search_client=None,
+             trace=False, on_progress=None, request_id=None):
+    """先领取会话，再执行一轮。网页重发同一操作时传相同 request_id，避免重复收费。
+
+    API 无状态并不意味着工程无状态：SQLite 保存请求结果和短事务租约。
+    不传 request_id 时仍串行保护会话，但相同文字被视为一次新的用户操作。
+    """
+    db_path = Path(db_path or DEFAULT_DB)
+    if not isinstance(user_text, str) or not user_text.strip() or len(user_text) > MAX_USER_CHARS:
+        raise ValueError("问题必须非空且不超过4000个字符")
+    if request_id is not None and (not isinstance(request_id, str) or not request_id
+                                   or len(request_id) > 128 or not all(c.isalnum() or c in '-_.' for c in request_id)):
+        raise ValueError("request_id 必须是最多128字符的字母、数字、短横线、下划线或点")
+    session_id = store.ensure_session(db_path, session_id)
+    claim = store.begin_request(db_path, session_id, user_text.strip(), request_id,
+                                TURN_TIMEOUT_SECONDS + TIMEOUT_SECONDS + 30)
+    if claim['state'] == 'cached':
+        return dict(claim['result'], replayed=True)
+    if claim['state'] != 'owned':
+        code = {'busy': 'SESSION_BUSY', 'conflict': 'REQUEST_ID_CONFLICT',
+                'interrupted': 'INTERRUPTED'}[claim['state']]
+        return {'session_id': session_id, 'turn_id': claim.get('turn_id'), 'status': 'incomplete',
+                'answer': {'SESSION_BUSY': '本会话上一轮仍在执行，请等待；没有发出新请求。',
+                           'REQUEST_ID_CONFLICT': '同一请求ID不能用于不同问题；没有发出新请求。',
+                           'INTERRUPTED': '该请求之前已中断，没有自动重试收费服务；新操作请使用新请求ID。'}[code],
+                'error_code': code, 'ledger_path': None, 'usage': {'requests': 0},
+                'data_usage': {'requests': 0}, 'search_usage': {'requests': 0}, 'replayed': False}
+    turn_id = claim['turn_id']
+    try:
+        result = _run_owned_turn(session_id, user_text, db_path=db_path, client=client,
+                                 data_client=data_client, search_client=search_client, trace=trace, on_progress=on_progress,
+                                 turn_id=turn_id)
+        store.complete_request(db_path, session_id, turn_id, result)
+        return result
+    finally:
+        # 包括查看页失败：租约也能释放；已保存的证据不回滚、不重复收费。
+        turn = store.get_turn(db_path, session_id, turn_id)
+        if turn and turn['status'] == 'running':
+            store.finish_turn(db_path, session_id, turn_id, 'incomplete', '本轮中断，已保存当前依据。', 'INTERRUPTED')
+        store.complete_request(db_path, session_id, turn_id)
+
+
+def _run_owned_turn(session_id, user_text, *, db_path, turn_id, client=None, data_client=None, search_client=None,
+                    trace=False, on_progress=None):
     """网站未来可调用此函数。client 可替换为离线模拟；不必把 Key 传入工具。"""
     from .tools import execute_tool, tool_definitions
     from .viewer import write_snapshot
@@ -116,7 +159,6 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
     if not isinstance(user_text, str) or not user_text.strip() or len(user_text) > MAX_USER_CHARS:
         raise ValueError("问题必须非空且不超过4000个字符")
     user_text = redact(user_text.strip())
-    turn_id = store.start_turn(db_path, session_id)
     message_id = store.add_message(db_path, session_id, turn_id, "user", user_text)
     started = time.monotonic()
     deadline = started + TURN_TIMEOUT_SECONDS
@@ -124,15 +166,18 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
         from .datapro import query_data
         data_client = lambda query: query_data(query, timeout_seconds=max(0.001, min(DATA_TIMEOUT_SECONDS, deadline - time.monotonic())))
     data_usage = {"requests": 0, "success": 0, "failed": 0, "timeouts": 0, "cache_hits": 0, "blocked": 0}
+    search_usage = dict(data_usage)
     ctx = {"db_path": db_path, "session_id": session_id, "turn_id": turn_id,
            "user_message_id": message_id, "allowed_evidence_ids": set(),
            "pending_recommendations": [], "data_client": data_client, "deadline": deadline,
-           "data_usage": data_usage, "data_cache": {}}
+           "data_usage": data_usage, "data_cache": {},
+           "search_client": search_client, "search_usage": search_usage, "search_cache": {}}
     user_evidence_id = store.add_evidence(db_path, session_id, turn_id, "user_input",
                                          {"message_id": message_id, "quote": user_text, "source": "当前用户原话"})
     ctx["allowed_evidence_ids"].add(user_evidence_id)
     usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-             "unreported_requests": 0}
+             "unreported_requests": 0, "cached_input_tokens": 0, "reasoning_tokens": 0,
+             "reported_details_requests": 0}
     status, answer, error_code = "incomplete", "", None
 
     def progress(stage):
@@ -149,6 +194,8 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
             raise
         seen_ids = set()
         for step in range(MAX_STEPS):
+            if not store.owns_lease(db_path, session_id, turn_id):
+                raise model.ModelError('INTERRUPTED')
             if time.monotonic() >= deadline:
                 raise model.ModelError("TURN_TIMEOUT")
             if context.char_size(messages) > context.CONTEXT_CHAR_BUDGET:
@@ -157,8 +204,13 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
             if trace:
                 progress("消息结构 " + ", ".join(item["role"] for item in messages))
             usage["requests"] += 1
-            reply = _request_model(client, messages, tool_definitions(), deadline)
+            try:
+                reply = _request_model(client, messages, tool_definitions(), deadline)
+            except BaseException:
+                usage['unreported_requests'] += 1
+                raise
             if not isinstance(reply, dict) or not isinstance(reply.get("message"), dict):
+                usage['unreported_requests'] += 1
                 raise model.ModelError("BAD_RESPONSE")
             reply_usage = reply.get("usage")
             if not isinstance(reply_usage, dict):
@@ -170,6 +222,19 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
                 value = reply_usage.get(key, 0)
                 if type(value) is int and value >= 0:
                     usage[key] += value
+            # 只累计已报告的固定数字字段，不把供应商任意附加内容写进账本。
+            details_complete = True
+            for container_name, field, target in (
+                    ('input_tokens_details', 'cached_tokens', 'cached_input_tokens'),
+                    ('output_tokens_details', 'reasoning_tokens', 'reasoning_tokens')):
+                details = reply_usage.get(container_name)
+                value = details.get(field) if isinstance(details, dict) else None
+                if type(value) is int and value >= 0:
+                    usage[target] += value
+                else:
+                    details_complete = False
+            if details_complete:
+                usage['reported_details_requests'] += 1
             message = reply["message"]
             if message.get("role") != "assistant":
                 raise model.ModelError("BAD_RESPONSE")
@@ -183,15 +248,22 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
                 clarification = None
                 batch_ok = True
                 for call in calls:
+                    if not store.owns_lease(db_path, session_id, turn_id):
+                        raise model.ModelError('INTERRUPTED')
                     if time.monotonic() >= deadline:
                         raise model.ModelError("TURN_TIMEOUT")
                     name = call["function"]["name"]
                     progress("执行工具：" + name)
                     result = execute_tool(ctx, call)
+                    if not store.owns_lease(db_path, session_id, turn_id):
+                        raise model.ModelError('INTERRUPTED')
                     batch_ok = batch_ok and bool(result.get("ok"))
                     messages.append({"role": "tool", "tool_call_id": call["id"],
                                      "content": json.dumps(redact(result), ensure_ascii=False, separators=(",", ":"))})
                     progress("记录依据：" + ("成功" if result.get("ok") else "拒绝或失败"))
+                    if name == "search_web":
+                        progress("豆包搜索请求 " + str(search_usage["requests"]) + "/" + str(MAX_SEARCH_REQUESTS)
+                                 + "，成功 " + str(search_usage["success"]) + "，失败 " + str(search_usage["failed"]))
                     if name == "query_professional_data":
                         progress("专业数据请求 " + str(data_usage["requests"]) + "/" + str(MAX_DATA_REQUESTS) + "，成功 "
                                  + str(data_usage["success"]) + "，失败 " + str(data_usage["failed"]))
@@ -235,11 +307,16 @@ def run_turn(session_id, user_text, *, db_path=None, client=None, data_client=No
         error_code = "INTERNAL_ERROR"
         answer = "本轮遇到内部错误，未完成；请查看测试或执行事件定位。"
     usage["data_requests"] = dict(data_usage)
-    store.finish_turn(db_path, session_id, turn_id, status, answer, error_code, usage)
-    store.add_message(db_path, session_id, turn_id, "assistant", answer)
+    usage["search_requests"] = dict(search_usage)
+    published = store.finish_turn(db_path, session_id, turn_id, status, answer, error_code, usage, require_lease=True)
+    if published:
+        store.add_message(db_path, session_id, turn_id, "assistant", answer)
+    else:
+        status, error_code = 'incomplete', 'INTERRUPTED'
+        answer = ERROR_TEXT[error_code]
     progress("生成账本查看页")
     output_dir = db_path.parent / "ledger"
     ledger_path = write_snapshot(db_path, session_id, turn_id, output_dir)
     return {"session_id": session_id, "turn_id": turn_id, "status": status,
             "answer": answer, "error_code": error_code, "ledger_path": str(ledger_path),
-            "usage": usage, "data_usage": dict(data_usage)}
+            "usage": usage, "data_usage": dict(data_usage), "search_usage": dict(search_usage)}

@@ -1,6 +1,6 @@
 """三镜 Agent 的首批业务工具。
 
-模型只能从下方固定注册表选择能力；本模块不提供 Shell、文件、网络、SQL
+模型只能从下方固定注册表选择能力；本模块不提供 Shell、任意文件或网络地址、SQL
 或任意 Python 执行接口。函数尽量保持直白，便于跟着调用链学习。
 """
 
@@ -20,7 +20,8 @@ from typing import Any
 
 from . import safety
 from .privacy import redact
-from .config import MAX_DATA_REQUESTS, DATA_TIMEOUT_SECONDS
+from .evidence_quality import quality_flags
+from .config import MAX_DATA_REQUESTS, DATA_TIMEOUT_SECONDS, MAX_SEARCH_REQUESTS
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -37,6 +38,7 @@ _PROFESSIONAL_CATEGORIES = {
     "public_financials": "查询公开财务资料：",
 }
 _DATASET_TYPE_ALIASES = {
+    "web_search": "web_search",
     "company_profile": "company_profile", "companyprofile": "company_profile",
     "enterprise_info": "company_profile", "enterpriseinfo": "company_profile",
     "企业画像": "company_profile", "企业信息": "company_profile", "工商信息": "company_profile",
@@ -230,7 +232,7 @@ def _call_data_client(ctx: dict[str, Any], category: str, query: str) -> dict[st
         usage["blocked"] += 1
         _record_data_failure(ctx, category, "deadline_exceeded")
         raise ToolFailure("data_timeout", "本轮专业资料查询时间已用尽。")
-    if usage["requests"] >= _MAX_DATA_REQUESTS_PER_TURN:
+    if usage["requests"] >= ctx.get("data_request_limit", _MAX_DATA_REQUESTS_PER_TURN):
         usage["blocked"] += 1
         _record_data_failure(ctx, category, "request_budget_exceeded")
         raise ToolFailure("data_budget_exceeded", "本轮专业资料查询次数已达上限。")
@@ -488,8 +490,13 @@ def _save_professional_record(
 ) -> str:
     safe_item = _clean_provider_data(item)
     source = _professional_source(safe_item)
+    if category == 'web_search':
+        # 网页没有统计单位和数据库编号很正常；只提示网页核查需要的缺失字段。
+        source['missing_fields'] = [field for field in source['missing_fields']
+                                    if field in ('url', 'url_invalid', 'published_at', 'provider')]
     data = {
         "category": category,
+        "source_type": "web_search" if category == "web_search" else "professional_dataset",
         "dataset_type": dataset_type,
         "query": query,
         "trace_id": trace_id,
@@ -502,6 +509,7 @@ def _save_professional_record(
         "query_evidence_id": query_evidence_id,
         "dependency_evidence_ids": [query_evidence_id],
     }
+    data['quality_flags'] = quality_flags(data)
     return _save_evidence(ctx, "professional_record", data, event_id=source_event_id, grant=grant)
 
 
@@ -600,6 +608,48 @@ def _query_professional_data(ctx: dict[str, Any], args: dict[str, Any]) -> dict[
         # 同一轮连失败也复用，防止模型反复提出相同查询而重复发起付费尝试。
         cache[cache_key] = {"error": {"code": exc.code, "message": exc.message}}
         raise
+    return _save_query_result(ctx, category, query, payload, cache, cache_key)
+
+
+def _search_web(ctx, args):
+    """独立搜索计数，共用外部证据保存逻辑；不允许模型选择服务地址。"""
+    from .doubao_search import build_request_body, search_web, SearchError
+    try:
+        body = build_request_body(args['query'], args.get('count', 5), args.get('sites'),
+                                  args.get('time_range', ''), args.get('authority', 0))
+    except SearchError as error:
+        raise ToolFailure(error.code, '搜索条件无效，尚未发出请求。') from None
+    # 浅复制让账本、当前事件和引用许可仍共享；只替换查询计数和缓存。
+    routed = dict(ctx)
+    routed['data_usage'] = ctx.setdefault('search_usage', {})
+    routed['data_cache'] = ctx.setdefault('search_cache', {})
+    routed['data_failures'] = ctx.setdefault('search_failures', [])
+    routed['data_request_limit'] = MAX_SEARCH_REQUESTS
+    client = ctx.get('search_client') or search_web
+    options = {'count': args.get('count', 5), 'sites': args.get('sites'),
+               'time_range': args.get('time_range', ''), 'authority': args.get('authority', 0)}
+    routed['data_client'] = lambda query, timeout_seconds: client(query, **options, timeout_seconds=timeout_seconds)
+    cache = routed['data_cache']
+    cache_key = json.dumps(body, sort_keys=True, ensure_ascii=False)
+    cached = cache.get(cache_key)
+    if cached:
+        _data_usage(routed)['cache_hits'] += 1
+        if 'error' in cached:
+            raise ToolFailure(cached['error']['code'], cached['error']['message'])
+        for evidence_id in cached['evidence_ids']:
+            _grant(ctx, evidence_id)
+        return {'data': cached['data'], 'evidence_ids': list(cached['evidence_ids'])}
+    try:
+        payload = _call_data_client(routed, 'web_search', body['Query'])
+    except ToolFailure as error:
+        cache[cache_key] = {'error': {'code': error.code, 'message': error.message}}
+        raise
+    result = _save_query_result(routed, 'web_search', body['Query'], payload, cache, cache_key)
+    return result
+
+
+def _save_query_result(ctx, category, query, payload, cache, cache_key):
+    """DataPro 和网页搜索共用的资料检查、候选保存与短索引；来源类型由程序赋值。"""
     try:
         if not isinstance(payload, dict):
             raise ToolFailure("data_structure_error", "专业资料服务返回格式无效。")
@@ -626,6 +676,8 @@ def _query_professional_data(ctx: dict[str, Any], args: dict[str, Any]) -> dict[
             raise ToolFailure("data_wrong_type", "返回资料类别与请求类别不匹配。")
         route_verified = normalized_type == category
         limitations: list[str] = []
+        if category == "web_search":
+            limitations.append("豆包结果仅为搜索摘要或片段，未阅读全文；排序与权威标签不证明内容正确。")
         if not route_verified:
             limitations.append("返回资料类型未映射到已核验类别，不能单独作为充分事实。")
         trace_id = payload.get("trace_id")
@@ -646,6 +698,7 @@ def _query_professional_data(ctx: dict[str, Any], args: dict[str, Any]) -> dict[
     snapshot_data = {
         "category": category,
         "query": query,
+        "source_type": "web_search" if category == "web_search" else "professional_dataset",
         "trace_id": trace_id,
         "dataset_type": dataset_type,
         "route_verified": route_verified,
@@ -660,6 +713,9 @@ def _query_professional_data(ctx: dict[str, Any], args: dict[str, Any]) -> dict[
     candidate_ids: list[str] = []
     for item_index, item in enumerate(items):
         source = _professional_source(_clean_provider_data(item))
+        if category == 'web_search':
+            source['missing_fields'] = [field for field in source['missing_fields']
+                                        if field in ('url', 'url_invalid', 'published_at', 'provider')]
         record_limitations = list(limitations)
         if source["missing_fields"]:
             record_limitations.append("来源元数据缺失：" + "、".join(source["missing_fields"]))
@@ -823,6 +879,8 @@ def _get_record(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
             result = {"data": {"record_type": record_type, "record": visible_record},
                       "evidence_ids": list(dict.fromkeys(granted + extra_ids + [record.get("id")]))}
             result_ids = result["evidence_ids"]
+            if record.get('kind') == 'professional_record':
+                result['data']['quality_flags'] = quality_flags(record['data'])
             envelope = {"ok": True, "data": result["data"], "error": None, "evidence_ids": result_ids}
             if _json_chars(envelope) > _MAX_PROFESSIONAL_RECORD_CHARS:
                 if not field_path and record.get("kind") == "professional_record":
@@ -861,6 +919,14 @@ def _get_record(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         "data": {"record_type": record_type, "record": recommendation},
         "evidence_ids": granted,
     }
+
+
+def _list_history(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """模型用分页索引找旧 ID；看到编号不等于读过或采用证据。"""
+    session_id, _, db_path = _session(ctx)
+    data = _store().history_index(db_path, session_id, args['record_type'],
+                                  args.get('before_seq'), args.get('limit', 10))
+    return {'data': dict(data, record_type=args['record_type']), 'evidence_ids': []}
 
 
 def _match_job(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -1177,18 +1243,19 @@ def _submit_decision(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any
                 query_record = _evidence(ctx, query_id)
                 if query_record.get("kind") != "professional_query":
                     raise ToolFailure("invalid_professional_source", "专业记录的查询来源无效。")
-                if query_record.get("turn_id") != record.get("turn_id"):
+                if (query_record.get("turn_id") != record.get("turn_id")
+                        or query_record["data"].get("category") != data.get("category")):
                     raise ToolFailure("invalid_professional_source", "专业记录与查询快照轮次不一致。")
                 event_id = record.get("event_id")
                 event = _store().get_event(db_path, session_id, event_id) if event_id else None
                 if (not event or event.get("status") != "success"
-                        or event.get("tool_name") != "query_professional_data"
+                        or event.get("tool_name") != ("search_web" if data.get("category") == "web_search" else "query_professional_data")
                         or event.get("turn_id") != record.get("turn_id")):
                     raise ToolFailure("source_event_incomplete", "引用的专业查询尚未成功完成。")
                 query_event_id = query_record.get("event_id")
                 query_event = _store().get_event(db_path, session_id, query_event_id) if query_event_id else None
                 if (not query_event or query_event.get("status") != "success"
-                        or query_event.get("tool_name") != "query_professional_data"
+                        or query_event.get("tool_name") != ("search_web" if data.get("category") == "web_search" else "query_professional_data")
                         or query_event.get("turn_id") != query_record.get("turn_id")):
                     raise ToolFailure("source_event_incomplete", "专业资料查询快照尚未成功完成。")
                 if not _professional_field_was_read(ctx, evidence_id, field_path):
@@ -1199,6 +1266,9 @@ def _submit_decision(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any
                     if limitation not in limitations:
                         limitations.append(limitation)
                 source = data.get("source") if isinstance(data.get("source"), dict) else {}
+                for flag in quality_flags(data):
+                    if flag['message'] not in limitations:
+                        limitations.append(flag['message'])
                 missing = source.get("missing_fields", [])
                 for item_limitation in data.get("limitations", []):
                     if isinstance(item_limitation, str) and item_limitation not in limitations:
@@ -1238,9 +1308,9 @@ def _submit_decision(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any
         })
 
     if not successful_professional_ids:
-        raise ToolFailure("professional_evidence_required", "通用决策至少需要一条查询成功的专业资料记录。")
+        raise ToolFailure("professional_evidence_required", "通用决策至少需要一条查询成功的外部来源记录。")
 
-    for failure in ctx.get("data_failures", []) if isinstance(ctx.get("data_failures"), list) else []:
+    for failure in list(ctx.get("data_failures", [])) + list(ctx.get("search_failures", [])):
         if not isinstance(failure, dict):
             continue
         category = failure.get("category", "professional")
@@ -1337,6 +1407,17 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
         "permission": "business_write",
         "handler": _submit_recommendation,
     },
+    "search_web": {
+        "description": "豆包网页搜索：查官方招聘页、政策、公开网页线索；摘要并非全文。结果需 get_record 读取后引用。",
+        "parameters": _object_schema({
+            "query": {"type": "string", "minLength": 1, "maxLength": 100},
+            "count": {"type": "integer", "minimum": 1, "maximum": 10},
+            "sites": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 253}},
+            "time_range": {"type": "string", "enum": ["", "OneDay", "OneWeek", "OneMonth", "OneYear"]},
+            "authority": {"type": "integer", "enum": [0, 1]},
+        }, ["query"]),
+        "permission": "business_read", "handler": _search_web,
+    },
     "query_professional_data": {
         "description": "按类别查询受限的专业资料；返回已索引候选及依据编号，更多候选可按查询快照的 JSON Pointer 读取。",
         "parameters": _object_schema({
@@ -1345,6 +1426,16 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
         }, ["category", "query"]),
         "permission": "business_read",
         "handler": _query_professional_data,
+    },
+    "list_history": {
+        "description": "分页查询本会话旧依据或已发布建议的编号；定位后须用 get_record 读取原文，索引不授予引用权限。",
+        "parameters": _object_schema({
+            "record_type": {"type": "string", "enum": ["evidence", "recommendation"]},
+            "before_seq": {"type": "integer", "minimum": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        }, ["record_type"]),
+        "permission": "business_read",
+        "handler": _list_history,
     },
     "submit_decision": {
         "description": "提交通用决策。事实值由引用字段自动解析；fact 标签由程序按字段名生成，user_statement 固定显示用户原话，只有 inference 的 text 会展示为模型推论。不要在标签中重写来源数字。",

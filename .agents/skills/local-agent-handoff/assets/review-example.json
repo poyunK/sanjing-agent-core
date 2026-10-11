@@ -1,0 +1,5 @@
+{
+  "decision": "rework",
+  "summary": "格式示例：缺少可复验的交付证据，需要补充。",
+  "checks": [{"command": "示例占位：尚未验收", "outcome": "not_run", "evidence": "模板，不代表实际复核", "exit_code": null}]
+}

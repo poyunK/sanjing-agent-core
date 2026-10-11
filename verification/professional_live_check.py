@@ -21,7 +21,7 @@ def main():
         if counts["model_requests"] >= 12:
             raise model.ModelError("LIVE_MODEL_BUDGET")
         counts["model_requests"] += 1
-        result = model.ask_llm(messages, definitions)
+        result = model.ask_llm(messages, definitions, provider='deepseek')
         for key in usage:
             usage[key] += result.get("usage", {}).get(key, 0)
         return result

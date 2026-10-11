@@ -34,7 +34,7 @@ second = run_turn(
 
 传入 `None` 会创建一个新会话；下一次用返回的 `session_id` 继续。`client=ask_offline` 是固定的演示脚本，不是能理解所有问题的离线大模型。
 
-调用真实 DeepSeek 时，先配置 `SANJING_KEY_FILE`，再省略 `client` 参数。模型和输出限制见 `config.py`，密钥读取只发生在 `model.py`。
+调用真实 Ark 时，先配置工程外的 `SANJING_ARK_KEY_FILE`，再省略 `client` 参数。默认模型为 `ark-code-latest`，模型和输出限制见 `config.py`，密钥只由客户端调用读取。旧 DeepSeek 可显式传入 `client=lambda messages, tools: model.ask_llm(messages, tools, provider="deepseek")`，其中 `model` 需从 `sanjing` 导入。
 
 ## 界面处理三个结果
 
@@ -45,6 +45,8 @@ second = run_turn(
 | `incomplete` | 显示失败或未完成原因，让用户主动重试 |
 
 返回字典还包含 `turn_id`、`error_code`、`usage` 和 `ledger_path`。输出分数来自程序计算，解释文字来自经过结构与引用检查的建议记录；不要另外请求模型重写一份报告，从而产生另一套依据。
+
+网页层给每次用户操作生成一个请求 ID，传给 `run_turn(..., request_id="...")`。重发使用同一 ID，用户主动新操作使用新 ID；相同 ID 换问题会被拒绝。`SESSION_BUSY` 表示本会话仍在执行，`ledger_path` 可能为 `None`，此时不展示账本链接。缓存结果的 `replayed=True`，其 usage 是原轮用量，不能再次计费累加。新建会话的重复请求要由网页层先分配并稳定保存 session_id；反复传 None 会创建不同会话。
 
 `on_progress` 接收脱敏后的阶段名称与累计耗时。Web 界面可把它转成进度提示；回调应快速返回，不要在回调中执行长任务。同步函数会等待模型，接入 Web 框架时按框架方式放到后台任务或工作线程，同一会话按顺序处理。
 

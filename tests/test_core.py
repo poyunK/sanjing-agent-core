@@ -77,6 +77,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "incomplete")
         self.assertEqual(result["error_code"], "MODEL_TIMEOUT")
         self.assertEqual(result["usage"]["requests"], 1)
+        self.assertEqual(result['usage']['unreported_requests'], 1)
 
     def test_content_and_multiple_calls_pair_correctly(self):
         responses = []
@@ -113,7 +114,7 @@ class CoreTests(unittest.TestCase):
         error = urllib.error.HTTPError("test", 401, "SECRET_BODY", {}, None)
         with patch("urllib.request.urlopen", side_effect=error) as request:
             with self.assertRaises(model.ModelError) as caught:
-                model.ask_llm([], [], key_file=key_file)
+                model.ask_llm([], [], key_file=key_file, provider='deepseek')
         self.assertEqual(str(caught.exception), "HTTP_401")
         self.assertEqual(request.call_count, 1)
 
@@ -127,7 +128,7 @@ class CoreTests(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=slow_request), patch("sanjing.model.TIMEOUT_SECONDS", 0.02):
             started = time.monotonic()
             with self.assertRaises(model.ModelError) as caught:
-                model.ask_llm([], [], key_file=key_file)
+                model.ask_llm([], [], key_file=key_file, provider='deepseek')
             self.assertLess(time.monotonic() - started, 0.08)
             self.assertEqual(caught.exception.code, "MODEL_TIMEOUT")
         time.sleep(0.11)  # 让模拟HTTP结束，避免测试替身线程影响后续测试。

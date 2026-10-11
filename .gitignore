@@ -7,7 +7,12 @@ runtime/
 !*.example
 *Key*.txt
 *key*.txt
+*Key*.yaml
+*key*.yaml
+*Key*.yml
+*key*.yml
 .idea/
 .vscode/
 *.log
+.handoff-local/
 

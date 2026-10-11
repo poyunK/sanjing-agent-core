@@ -16,14 +16,17 @@ import urllib.request
 from pathlib import Path
 
 from . import privacy
+from .config import ARK_KEY_FILE
+from .key_loader import KeyFileError, load_ark_key
 
 
 DATAPRO_URL = "https://datapro.hqd.cn-beijing.volces.com/mcp"
 PROTOCOL_VERSION = "2025-03-26"
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_TIMEOUT_SECONDS = 60.0
-DEFAULT_KEY_FILE = Path("C:/Users/pla53519/Documents/火山keyUTF8.txt")
+DEFAULT_KEY_FILE = ARK_KEY_FILE
 KEY_ENV_NAME = "SANJING_DATAPRO_KEY_FILE"
+ARK_KEY_ENV_NAME = "SANJING_ARK_KEY_FILE"
 _MASK = "[密钥已隐藏]"
 
 
@@ -42,19 +45,16 @@ class _CrossOriginRedirect(Exception):
 def _key_path(key_file=None):
     if key_file is not None:
         return Path(key_file)
-    configured = os.environ.get(KEY_ENV_NAME)
+    configured = os.environ.get(KEY_ENV_NAME) or os.environ.get(ARK_KEY_ENV_NAME)
     return Path(configured) if configured else DEFAULT_KEY_FILE
 
 
 def _load_key(key_file=None):
     """读取唯一授权来源的 DataPro Key；调用者不得记录返回值。"""
     try:
-        key = _key_path(key_file).read_text(encoding="utf-8-sig").strip()
-    except (OSError, TypeError, ValueError):
-        raise DataproError("KEY_UNAVAILABLE") from None
-    if not key or any(character.isspace() for character in key):
-        raise DataproError("KEY_INVALID")
-    return key
+        return load_ark_key(_key_path(key_file))
+    except KeyFileError as error:
+        raise DataproError(error.code) from None
 
 
 def _same_origin(first, second):

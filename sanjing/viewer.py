@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from . import store
+from .evidence_quality import quality_flags
 
 
 _STYLE = """
@@ -318,8 +319,8 @@ def _professional_query_card(item: dict[str, Any], data: dict[str, Any]) -> str:
     content = "".join(_field_html(label, value) for label, value in fields)
     return (
         f'<article class="card" id="{_anchor_id(item.get("id"))}" data-kind="professional-query">'
-        '<h4>专业数据查询记录</h4>'
-        f'<div class="muted">类型：专业数据查询　证据 ID：<code>{_e(item.get("id"))}</code></div>'
+        f'<h4>{"豆包网页搜索查询记录" if data.get("category") == "web_search" else "专业数据查询记录"}</h4>'
+        f'<div class="muted">类型：{"豆包网页搜索" if data.get("category") == "web_search" else "专业数据查询"}　证据 ID：<code>{_e(item.get("id"))}</code></div>'
         f"{content}"
         '<p class="muted">原始 payload、snapshot、response 和请求头不在页面展开；请查看单独保存的源记录证据。</p>'
         '</article>'
@@ -343,6 +344,7 @@ def _professional_record_card(item: dict[str, Any], data: dict[str, Any],
     safe_url = _url_html(source.get("url"))
     provenance = [
         ("数据类别", data.get("category")),
+        ("适用性提示（程序规则，仍需人工核对）", [flag['message'] for flag in quality_flags(data)]),
         ("数据集类型", data.get("dataset_type")),
         ("查询", data.get("query")),
         ("调用追踪 ID", data.get("trace_id")),
@@ -365,8 +367,8 @@ def _professional_record_card(item: dict[str, Any], data: dict[str, Any],
     metadata = "".join(_field_html(label, value) for label, value in provenance)
     return (
         f'<article class="card" id="{_anchor_id(item.get("id"))}" data-kind="professional-record">'
-        '<h4>专业数据源记录</h4>'
-        f'<div class="muted">类型：专业数据记录　证据 ID：<code>{_e(item.get("id"))}</code></div>'
+        f'<h4>{"豆包网页搜索来源记录" if data.get("category") == "web_search" else "专业数据源记录"}</h4>'
+        f'<div class="muted">类型：{"网页搜索摘要" if data.get("category") == "web_search" else "专业数据记录"}　证据 ID：<code>{_e(item.get("id"))}</code></div>'
         f"{metadata}"
         f'<div class="field"><strong>来源链接</strong><p>{safe_url}</p></div>'
         '<details><summary>展开可读源字段</summary>'
@@ -464,6 +466,7 @@ def _citation_source_html(evidence_id: str, field_path: str,
     if kind == "professional_record":
         source = data.get("source") if isinstance(data.get("source"), dict) else {}
         meta = [
+            ("适用性提示（仍需人工核对）", [flag['message'] for flag in quality_flags(data)]),
             ("提供方", source.get("provider")),
             ("源记录 ID", source.get("record_id")),
             ("发布时间", source.get("published_at")),
@@ -758,9 +761,9 @@ def _recommendation_card(rec: dict[str, Any], index: int, user_input: str,
     return "".join(pieces)
 
 
-def _data_usage_html(usage: Any) -> str:
+def _data_usage_html(usage: Any, search=False) -> str:
     labels = {
-        "requests": "专业查询客户端尝试次数", "success": "返回有效候选次数",
+        "requests": "豆包搜索客户端尝试次数" if search else "专业查询客户端尝试次数", "success": "返回有效候选次数",
         "failed": "查询失败次数", "timeouts": "查询超时次数",
         "cache_hits": "本轮结果复用次数", "blocked": "调用前拦截次数（未进入查询客户端）",
         "input_tokens": "输入 token 数", "prompt_tokens": "提示 token 数",
@@ -784,7 +787,7 @@ def _data_usage_html(usage: Any) -> str:
         + '</tbody></table>'
     )
     return (
-        '<h4>本轮使用统计</h4>' + table
+        ('<h4>豆包搜索使用统计</h4>' if search else '<h4>本轮使用统计</h4>') + table
         + '<p class="muted">费用没有在本地账本中核验。调用超时不代表供应商已取消请求，'
           '该次请求是否产生费用目前未知。</p>'
     )
@@ -865,12 +868,17 @@ def _build_html(snapshot: dict[str, Any]) -> str:
     )
     turn_usage = turn.get("usage") if isinstance(turn.get("usage"), dict) else {}
     usage_html = _data_usage_html(turn.get("data_usage") or turn_usage.get("data_requests"))
+    if turn_usage.get("search_requests"):
+        usage_html += _data_usage_html(turn_usage["search_requests"], search=True)
     if turn_usage:
         usage_html += _field_html("模型用量（与专业查询分别记录）", {
-            key: turn_usage[key] for key in ("requests", "prompt_tokens", "completion_tokens", "total_tokens", "unreported_requests")
+            key: turn_usage[key] for key in ("requests", "prompt_tokens", "completion_tokens", "total_tokens", "unreported_requests",
+                                           "cached_input_tokens", "reasoning_tokens", "reported_details_requests")
             if key in turn_usage})
         if turn_usage.get("unreported_requests"):
             usage_html += '<p class="muted">部分模型请求未回传完整 token 用量；当前累计值不代表全部消耗。</p>'
+        if 'reported_details_requests' in turn_usage:
+            usage_html += '<p class="muted">缓存输入和推理 token 仅累计已报告数字；reported_details_requests 表示回传两项细分统计的请求数。推理 token 数量不是思维内容。</p>'
 
     # 页面不显示模型原始消息/思维内容；只展示结构化建议、用户输入和工具事件。
     page_title = "三镜 Agent · 本轮依据账本"
